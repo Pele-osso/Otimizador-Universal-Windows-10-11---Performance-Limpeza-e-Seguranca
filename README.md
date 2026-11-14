@@ -27,14 +27,15 @@
    * Se o SSD tiver pouco espaço livre (`< 35 GB`), define `2048 MB` inicial; se tiver bastante espaço, define `4096 MB` inicial, com teto de `8192 MB` (ou `12288 MB` em PCs com `<= 8 GB` de RAM), e **remove qualquer `pagefile` que esteja em HDs mecânicos lentos**.
 8. **[8/11] Serviços e Telemetria (*Padrão WinUtil / AtlasOS*):** Desativa telemetria da Microsoft (`DiagTrack`, `dmwappushservice`, `MapsBroker`, `lfsvc`, `RetailDemo`, `Wisvc`) e telemetria oculta da Intel (`QUEENCREEK` + tarefa agendada oculta). Se o Windows estiver num **SSD**, desativa também o `SysMain` (*Superfetch*); se o Windows estiver instalado num **HD mecânico**, mantém o `SysMain` ligado (pois em HDs antigos ele ajuda no carregamento).
 9. **[9/11] Inicialização Limpa (`Run`):** Retira launchers pesados de jogos (*Steam, Epic, EA, Riot, Rave, Battle.net, Ubisoft, GOG* e *Discord* duplicado) da abertura simultânea com o Windows, mantendo todos os drivers (áudio, vídeo, mouse/teclado e antivírus).
-10. **[10/11] Jogos, GPU, Contraste/Cor e Latência:** Ativa o **HAGS (`HwSchMode = 2`)**, ativa o **Modo de Jogo**, desativa a gravação oculta **GameDVR** preservando `GameDVR_FSEBehaviorMode = 0` e removendo `OverlayTestMode` (evitando tela lavada/filtro branco em tela cheia), força **RGB Completo (`0-255`)** via NVAPI, restaura **Gama linear `1.0`** e checa via **DDC/CI** se o monitor está com contraste `< 30` ou Black Level `> 55`, ajusta prioridade multimídia/rede (`SystemResponsiveness = 10`, `NetworkThrottlingIndex = ffffffff`, GPU `8` / CPU `High`) e zera o atraso de menus (`MenuShowDelay = 0`).
+10. **[10/11] Jogos, GPU, Contraste/Cor e Latência:** Ativa o **HAGS (`HwSchMode = 2`)**, ativa o **Modo de Jogo**, desativa a gravação oculta **GameDVR** preservando `GameDVR_FSEBehaviorMode = 0` e removendo `OverlayTestMode` (evitando tela lavada/filtro branco em tela cheia), força **RGB Completo (`0-255`)** via NVAPI, restaura **Gama linear `1.0`** e checa via **DDC/CI** se o monitor está com contraste `< 30` ou Black Level `> 55`, ajusta prioridade multimídia/rede (`SystemResponsiveness = 10`, `NetworkThrottlingIndex = ffffffff`, GPU `8` / CPU `High`) ajusta áudio multimídia (`Audio`/`Pro Audio` em prioridade `High`, garante Estéreo real com `AccessibilityMonoMixState = 0` e bloqueia redução de chamadas com `UserDuckingPreference = 3`) e zera o atraso de menus (`MenuShowDelay = 0`).
 11. **[11/11] Limpeza Profunda + Reparo Oficial (`DISM` e `SFC`):** Limpa pastas `Temp`, `CrashDumps`, `SquirrelTemp`, caches residuais, esvazia todas as Lixeiras e roda `DISM /CheckHealth` (executando `DISM /RestoreHealth` se houver corrupção) seguido de `sfc /scannow`.
 
 ---
 
 ## Código Interno do `Otimizador_Universal_Windows.bat`
 
-```bat@echo off
+```bat
+@echo off
 chcp 65001 >nul
 title Otimizador Universal Windows 10/11 - Performance, Limpeza e Seguranca
 
@@ -405,6 +406,18 @@ if (Test-Path "$mm\Tasks\Games") {
     Set-ItemProperty -Path "$mm\Tasks\Games" -Name 'Scheduling Category' -Value 'High' -Type String -Force
     Set-ItemProperty -Path "$mm\Tasks\Games" -Name 'SFIO Priority' -Value 'High' -Type String -Force
 }
+foreach ($audTask in @('Audio','Pro Audio')) {
+    if (Test-Path "$mm\Tasks\$audTask") {
+        $pVal = if ($audTask -eq 'Pro Audio') { 2 } else { 6 }
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'Scheduling Category' -Value 'High' -Type String -Force
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'GPU Priority' -Value 8 -Type DWord -Force
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'Priority' -Value $pVal -Type DWord -Force
+    }
+}
+$mmUsr = 'HKCU:\Software\Microsoft\Multimedia\Audio'
+New-Item -Path $mmUsr -Force | Out-Null
+Set-ItemProperty -Path $mmUsr -Name 'AccessibilityMonoMixState' -Value 0 -Type DWord -Force
+Set-ItemProperty -Path $mmUsr -Name 'UserDuckingPreference' -Value 3 -Type DWord -Force
 Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value '0' -Type String -Force
 
 # 11. Limpeza de Arquivos Temporarios, Caches, Lixeiras e Reparo DISM + SFC

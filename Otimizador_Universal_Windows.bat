@@ -369,6 +369,18 @@ if (Test-Path "$mm\Tasks\Games") {
     Set-ItemProperty -Path "$mm\Tasks\Games" -Name 'Scheduling Category' -Value 'High' -Type String -Force
     Set-ItemProperty -Path "$mm\Tasks\Games" -Name 'SFIO Priority' -Value 'High' -Type String -Force
 }
+foreach ($audTask in @('Audio','Pro Audio')) {
+    if (Test-Path "$mm\Tasks\$audTask") {
+        $pVal = if ($audTask -eq 'Pro Audio') { 2 } else { 6 }
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'Scheduling Category' -Value 'High' -Type String -Force
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'GPU Priority' -Value 8 -Type DWord -Force
+        Set-ItemProperty -Path "$mm\Tasks\$audTask" -Name 'Priority' -Value $pVal -Type DWord -Force
+    }
+}
+$mmUsr = 'HKCU:\Software\Microsoft\Multimedia\Audio'
+New-Item -Path $mmUsr -Force | Out-Null
+Set-ItemProperty -Path $mmUsr -Name 'AccessibilityMonoMixState' -Value 0 -Type DWord -Force
+Set-ItemProperty -Path $mmUsr -Name 'UserDuckingPreference' -Value 3 -Type DWord -Force
 Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value '0' -Type String -Force
 
 # 11. Limpeza de Arquivos Temporarios, Caches, Lixeiras e Reparo DISM + SFC
