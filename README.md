@@ -1,0 +1,1 @@
+# Otimizador-Universal-Windows-10-11---Performance-Limpeza-e-Seguranca
