@@ -138,15 +138,24 @@ if ($ultGuids.Count -eq 0) {
 powercfg /setactive $activeGuid
 powercfg /change disk-timeout-ac 0
 powercfg /change standby-timeout-ac 0
-# PCIe Link State Power Management -> Off (0)
+# Em Desktop, garante PCIe ASPM Desligado (0) e Disk Idle 0 em TODOS os planos (evita BusReset TDR / disk 153 ao alternar planos)
+foreach ($pLine in ($plansOutput)) {
+    if ($pLine -match '([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
+        $g = $matches[1]
+        if (-not $isLaptop) {
+            powercfg /setacvalueindex $g 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0 2>$null
+            powercfg /setacvalueindex $g 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e769756e 0 2>$null
+        }
+    }
+}
+# PCIe Link State Power Management -> Off (0) e USB Selective Suspend -> Disabled (0) no plano ativo
 powercfg /setacvalueindex $activeGuid 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
-# USB Selective Suspend -> Disabled (0)
 powercfg /setacvalueindex $activeGuid 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
 powercfg /setactive $activeGuid
 if (-not $isLaptop) {
     powercfg /h off
 }
-Log " -> Plano Desempenho Maximo ativo ($activeGuid) | Disk Idle=0 | PCIe ASPM=Off | USB Suspend=Off" "Gray"
+Log " -> Plano Desempenho Maximo ativo ($activeGuid) | Disk Idle=0 | PCIe ASPM=Off (todos os planos em Desktop) | USB Suspend=Off" "Gray"
 
 # 6. Otimizacao de Discos (TRIM em todos os SSDs / Desativar Indexacao em todos os HDDs)
 Log "`n[6/11] Otimizando Todos os Discos (SSDs e HDDs)..."
@@ -383,8 +392,8 @@ Set-ItemProperty -Path $mmUsr -Name 'AccessibilityMonoMixState' -Value 0 -Type D
 Set-ItemProperty -Path $mmUsr -Name 'UserDuckingPreference' -Value 3 -Type DWord -Force
 Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value '0' -Type String -Force
 
-# 11. Limpeza de Arquivos Temporarios, Caches, Lixeiras e Reparo DISM + SFC
-Log "`n[11/11] Limpando Temporarios, Caches, Lixeiras e Verificando Integridade do Windows..."
+# 11. Limpeza de Arquivos Temporarios, Caches, Correcao de Erros do Sistema e Reparo DISM + SFC
+Log "`n[11/11] Limpando Temporarios, Corrigindo Erros do Windows e Verificando Integridade..."
 $junkPaths = @(
     "$env:LOCALAPPDATA\Temp\*",
     "$env:SystemRoot\Temp\*",
@@ -396,7 +405,9 @@ $junkPaths = @(
     "$env:LOCALAPPDATA\UniSDK_FirstOpen",
     "$env:LOCALAPPDATA\UniCompactView",
     "$env:APPDATA\hydralauncher",
-    "$env:SystemDrive\`$SysReset"
+    "$env:SystemDrive\`$SysReset",
+    "$env:SystemRoot\LiveKernelReports\**\*.dmp",
+    "$env:SystemRoot\Minidump\*.dmp"
 )
 foreach ($jp in $junkPaths) {
     Remove-Item -Path $jp -Recurse -Force
@@ -411,6 +422,101 @@ Get-PSDrive -PSProvider FileSystem | ForEach-Object {
     if (Test-Path $stremioCache) { Remove-Item -Path "$stremioCache\*" -Recurse -Force }
 }
 Clear-RecycleBin -Force
+
+# 11a. Remover servicos/drivers orfaos cujo arquivo .sys nao existe na unidade do sistema ou em disco conectado
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\*' -ErrorAction SilentlyContinue | ForEach-Object {
+    $ip = $_.ImagePath
+    $svcName = $_.PSChildName
+    if ($ip -and ($_.Type -eq 1 -or $_.Type -eq 2) -and ($_.Start -in @(0,1,2,3))) {
+        $sysFull = $null
+        if ($ip -match '^(?:\\\?\?\\)?([A-Za-z]:\\.+?\.sys)$') { $sysFull = $matches[1] }
+        elseif ($ip -match '^(system32\\drivers\\.+\.sys)$') { $sysFull = Join-Path $env:SystemRoot $matches[1] }
+        if ($sysFull -and ($sysFull -match '^([A-Za-z]:)\\') -and (Test-Path ($matches[1] + '\')) -and (-not (Test-Path $sysFull))) {
+            sc.exe stop $svcName 2>$null | Out-Null
+            sc.exe delete $svcName 2>$null | Out-Null
+            Log (" -> Removido servico de driver orfao inexistente: $svcName ($sysFull)") "Yellow"
+        }
+    }
+}
+
+# 11b. Corrigir WMI Autorecover MOFs ausentes/duplicados (WMI Error 4)
+try {
+    $cimomKey = 'HKLM:\SOFTWARE\Microsoft\Wbem\CIMOM'
+    $curMofs = (Get-ItemProperty $cimomKey -ErrorAction SilentlyContinue).'Autorecover MOFs'
+    if ($curMofs) {
+        $seenMof = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $cleanMof = [System.Collections.Generic.List[string]]::new()
+        $mofChanged = $false
+        foreach ($m in $curMofs) {
+            if ([string]::IsNullOrWhiteSpace($m)) { $mofChanged = $true; continue }
+            $exp = [Environment]::ExpandEnvironmentVariables($m)
+            if ((Test-Path $exp) -and $seenMof.Add($m)) { $cleanMof.Add($m) }
+            else { $mofChanged = $true }
+        }
+        $latestDefMof = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform" -Filter 'ProtectionManagement.mof' -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latestDefMof -and $seenMof.Add($latestDefMof.FullName)) {
+            $cleanMof.Add($latestDefMof.FullName)
+            $mofChanged = $true
+        }
+        if ($mofChanged) {
+            Set-ItemProperty -Path $cimomKey -Name 'Autorecover MOFs' -Value ([string[]]$cleanMof.ToArray()) -Type MultiString -Force
+            if ($latestDefMof) { mofcomp $latestDefMof.FullName 2>$null | Out-Null }
+            Log " -> Lista Autorecover MOFs do WMI limpa (removidas referencias quebradas)." "Gray"
+        }
+    }
+    $wmiVer = winmgmt /verifyrepository 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($wmiVer -join ' ') -match 'inconsist|not consistent') {
+        winmgmt /salvagerepository 2>$null | Out-Null
+        Log " -> Repositorio WMI reparado automaticamente." "Yellow"
+    }
+} catch {}
+
+# 11c. Corrigir conflito VBS/HVCI causando Kernel-Boot 124 no Event Log
+try {
+    $kb124 = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Boot'; Id=124; StartTime=(Get-Date).AddDays(-7) } -MaxEvents 1 -ErrorAction SilentlyContinue
+    if ($kb124) {
+        $hvciReg = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+        if (Test-Path $hvciReg) {
+            Set-ItemProperty -Path $hvciReg -Name 'Enabled' -Value 0 -Type DWord -Force
+            Set-ItemProperty -Path $hvciReg -Name 'WasEnabledBy' -Value 0 -Type DWord -Force
+        }
+        $dgReg = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+        if (Test-Path $dgReg) { Set-ItemProperty -Path $dgReg -Name 'EnableVirtualizationBasedSecurity' -Value 0 -Type DWord -Force }
+        Log " -> Conflito VBS/HVCI (Kernel-Boot 124) desativado para estabilidade e FPS." "Yellow"
+    }
+} catch {}
+
+# 11d. Instalar drivers de sistema/chipset pendentes via Windows Update caso haja dispositivo PCI/System com erro de instalacao
+try {
+    $badSysDevs = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Problem -eq 'CM_PROB_FAILED_INSTALL' -and $_.InstanceId -match '^PCI\\' }
+    if ($badSysDevs) {
+        $sess = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $sess.CreateUpdateSearcher()
+        $drvRes = $searcher.Search("IsInstalled=0 and Type='Driver'")
+        $drvColl = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($du in $drvRes.Updates) {
+            $hwids = ($du.DriverHardwareID -join ';').ToLower()
+            if ($hwids -match '^pci\\|pci\\ven_') { [void]$drvColl.Add($du) }
+        }
+        if ($drvColl.Count -gt 0) {
+            $dl = $sess.CreateUpdateDownloader(); $dl.Updates = $drvColl; [void]$dl.Download()
+            $inst = $sess.CreateUpdateInstaller(); $inst.Updates = $drvColl; [void]$inst.Install()
+            Log (" -> Drivers oficiais PCI/Chipset pendentes instalados via Windows Update (" + $drvColl.Count + ").") "Green"
+        }
+    }
+} catch {}
+
+# 11e. Agendar verificacao OFFLINE segura no proximo boot apenas se houver erro Ntfs Id=55 recente (evita travamento online)
+try {
+    $ntfs55 = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Ntfs'; Id=55; StartTime=(Get-Date).AddDays(-7) } -MaxEvents 10 -ErrorAction SilentlyContinue
+    if ($ntfs55) {
+        $badVols = $ntfs55 | ForEach-Object { if ($_.Properties.Count -gt 0) { ($_.Properties[0].Value + '').Trim() } } | Where-Object { $_ -match '^[A-Za-z]:$' } | Select-Object -Unique
+        foreach ($bv in $badVols) {
+            fsutil dirty set $bv | Out-Null
+            Log (" -> Corrupcao NTFS recente em $bv - reparo offline seguro agendado para o proximo boot.") "Yellow"
+        }
+    }
+} catch {}
 
 Log " -> Verificando saude da imagem do Windows (DISM /CheckHealth)..." "Gray"
 $dismCheck = DISM.exe /Online /Cleanup-Image /CheckHealth
