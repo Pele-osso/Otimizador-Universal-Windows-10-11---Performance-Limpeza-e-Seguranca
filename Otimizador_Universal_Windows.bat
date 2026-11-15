@@ -2,34 +2,257 @@
 chcp 65001 >nul
 title Otimizador Universal Windows 10/11 - Performance, Limpeza e Seguranca
 
+set "OTIMIZADOR_ARGS=%~1"
+set "OTIMIZADOR_SELF=%~f0"
+
 :: Verifica se esta rodando como Administrador; se nao, solicita elevacao automatica
+if /i "%OTIMIZADOR_ARGS%"=="-verificar" goto :RunPS
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo [!] Solicitando permissao de Administrador...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    if "%OTIMIZADOR_ARGS%"=="" (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:OTIMIZADOR_SELF -Verb RunAs"
+    ) else (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:OTIMIZADOR_SELF -ArgumentList $env:OTIMIZADOR_ARGS -Verb RunAs"
+    )
     exit /b
 )
 
+:RunPS
 cls
 echo ============================================================================
 echo      OTIMIZADOR UNIVERSAL WINDOWS 10/11 (HARDWARE-AWARE / OPEN-SOURCE)
 echo ============================================================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$lines = [System.IO.File]::ReadAllLines('%~f0', [System.Text.Encoding]::UTF8); $idx = [Array]::IndexOf($lines, ':: === INICIO_POWERSHELL ==='); $code = $lines[($idx+1)..($lines.Length-1)] -join [Environment]::NewLine; Invoke-Expression $code"
-echo.
-echo ============================================================================
-echo   PROCESSO FINALIZADO! Reinicie o computador para aplicar todos os ajustes.
-echo ============================================================================
-pause
-exit /b
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$lines = [System.IO.File]::ReadAllLines($env:OTIMIZADOR_SELF, [System.Text.Encoding]::UTF8); $idx = [Array]::IndexOf($lines, ':: === INICIO_POWERSHELL ==='); $code = $lines[($idx+1)..($lines.Length-1)] -join [Environment]::NewLine; & ([ScriptBlock]::Create($code))" & exit /b
 :: === INICIO_POWERSHELL ===
 $ErrorActionPreference = 'SilentlyContinue'
-$desktop = [Environment]::GetFolderPath('Desktop')
-$logFile = Join-Path $desktop ("Relatorio_Otimizacao_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".txt")
+$DefaultOtimRawUrl = 'https://raw.githubusercontent.com/Pele-osso/Otimizador-Universal-Windows-10-11---Performance-Limpeza-e-Seguranca/main/Otimizador_Universal_Windows.bat'
+$OtimStateDir      = Join-Path $env:ProgramData 'OtimizadorUniversal'
+$OtimStateFile     = Join-Path $OtimStateDir 'update_state.json'
+$otimArgNorm       = ($env:OTIMIZADOR_ARGS + '').Trim().ToLower()
+$desktop           = [Environment]::GetFolderPath('Desktop')
+$logFile           = Join-Path $desktop ("Relatorio_Otimizacao_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".txt")
 
 function Log($msg, $color = "Cyan") {
     Write-Host $msg -ForegroundColor $color
-    Add-Content -Path $logFile -Value $msg -Encoding UTF8
+    if ($otimArgNorm -ne '-verificar') { Add-Content -Path $logFile -Value $msg -Encoding UTF8 }
+}
+
+function Get-OtimHardwareSnapshot {
+    $cpuObj = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $osObj  = Get-CimInstance Win32_OperatingSystem | Select-Object -First 1
+    $gpuCtl = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+    $gpuMain = $gpuCtl | Where-Object { $_.Name -match 'NVIDIA|AMD|Radeon|Arc' } | Select-Object -First 1
+    if (-not $gpuMain) { $gpuMain = $gpuCtl | Select-Object -First 1 }
+    $gpuName = if ($gpuMain) { $gpuMain.Name } else { 'GPU Desconhecida' }
+    $vendor  = if ($gpuName -match 'NVIDIA') { 'NVIDIA' } elseif ($gpuName -match 'AMD|Radeon') { 'AMD' } elseif ($gpuName -match 'Intel') { 'Intel' } else { 'Other' }
+    $vramMB  = if ($gpuMain -and $gpuMain.AdapterRAM) { [math]::Round($gpuMain.AdapterRAM / 1MB, 0) } else { 0 }
+    $drvVer  = if ($gpuMain -and $gpuMain.DriverVersion) { $gpuMain.DriverVersion } else { '' }
+    $cudaVer = ''; $cudaNum = 0.0
+    $nvSmi = @((Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source), 'C:\Windows\System32\nvidia-smi.exe', 'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe') | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($vendor -eq 'NVIDIA' -and $nvSmi) {
+        $m = (& $nvSmi --query-gpu=memory.total,driver_version --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
+        if ($m -match '^([\d\.]+),\s*([^\s,]+)') {
+            $tmpV = 0.0; if ([double]::TryParse($Matches[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$tmpV) -and $tmpV -gt 0) { $vramMB = [int][math]::Round($tmpV) }
+            $drvVer = $Matches[2]
+        }
+        $hdr = (& $nvSmi 2>$null | Out-String)
+        if ($hdr -match 'CUDA Version:\s*([\d\.]+)') {
+            $cudaVer = $Matches[1]
+            [void][double]::TryParse($cudaVer, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$cudaNum)
+        }
+    }
+    $isPascalOrOlder = ($vendor -eq 'NVIDIA') -and ($gpuName -match 'GTX\s*(7\d\d|8\d\d|9\d\d|10\d\d|16\d\d)|GT\s*\d+|MX\d+|TITAN\s*(X|Xp|V)?\b')
+    $sysLet  = $env:SystemDrive.TrimEnd(':')
+    $sysPart = Get-Partition -DriveLetter $sysLet -ErrorAction SilentlyContinue
+    $sysDisk = if ($sysPart) { Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $sysPart.DiskNumber } | Select-Object -First 1 } else { $null }
+    return [PSCustomObject]@{
+        CpuName         = ($cpuObj.Name -replace '\s+', ' ').Trim()
+        RamTotalGB      = [math]::Round($osObj.TotalVisibleMemorySize / 1MB, 1)
+        IsLaptop        = ($null -ne (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue))
+        SysDriveLetter  = $sysLet
+        SysDisk         = $sysDisk
+        IsOsOnSSD       = ($sysDisk -and $sysDisk.MediaType -eq 'SSD')
+        GpuName         = $gpuName
+        GpuVendor       = $vendor
+        VramMB          = $vramMB
+        LowVram         = ($vramMB -gt 0 -and $vramMB -le 4200)
+        IsPascalOrOlder = $isPascalOrOlder
+        NoTensorCores   = ($vendor -ne 'NVIDIA') -or $isPascalOrOlder
+        DriverVersion   = $drvVer
+        CudaVersion     = $cudaVer
+        CudaNumeric     = $cudaNum
+        OsBuild         = [System.Environment]::OSVersion.Version.Build
+    }
+}
+
+function Get-OtimGitHubRelease {
+    param([string]$Repo, [string]$AssetRegex = '\.(zip|7z)$')
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    $headers = @{ 'User-Agent' = 'OtimizadorUniversalUpdater'; 'Cache-Control' = 'no-cache' }
+    $tag = $null; $assets = @()
+    try {
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers -TimeoutSec 15
+        if ($rel -and $rel.tag_name) { $tag = ($rel.tag_name + '').Trim(); if ($rel.assets) { $assets = @($rel.assets) } }
+    } catch {
+        try {
+            $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -Headers $headers -MaximumRedirection 5 -UseBasicParsing -TimeoutSec 15
+            if ($resp.BaseResponse -and $resp.BaseResponse.ResponseUri -and $resp.BaseResponse.ResponseUri.AbsoluteUri -match '/releases/tag/([^/?#]+)') {
+                $tag = [Uri]::UnescapeDataString($Matches[1]).Trim()
+            }
+        } catch {}
+    }
+    $sel = if ($assets.Count -gt 0 -and $AssetRegex) { $assets | Where-Object { $_.name -match $AssetRegex } | Select-Object -First 1 } else { $null }
+    if (-not $sel -and $assets.Count -gt 0) { $sel = $assets | Where-Object { $_.name -match '\.(zip|7z)$' } | Select-Object -First 1 }
+    return [PSCustomObject]@{ Repo=$Repo; TagName=$tag; AssetName=if ($sel){$sel.name}else{$null}; DownloadUrl=if ($sel){$sel.browser_download_url}else{$null} }
+}
+
+function Invoke-OtimizadorOnlineUpdate {
+    param($Hw, [switch]$CheckOnly)
+    if (-not $Hw) { $Hw = Get-OtimHardwareSnapshot }
+    if (-not [System.Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable()) {
+        Log " -> Sem internet no momento; verificacao online ignorada." "Yellow"
+        return [PSCustomObject]@{ SelfUpdated=$false }
+    }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    # A. Auto-atualizacao do proprio Otimizador_Universal_Windows.bat via GitHub (verificando AST antes de gravar)
+    $selfPath = $env:OTIMIZADOR_SELF
+    $selfUpdated = $false; $remoteAvail = $false
+    try {
+        $resp = Invoke-WebRequest -Uri $DefaultOtimRawUrl -Headers @{ 'User-Agent'='OtimizadorUniversalUpdater'; 'Cache-Control'='no-cache' } -UseBasicParsing -TimeoutSec 15
+        $remTxt = $resp.Content
+        if ($remTxt -and $remTxt.Length -ge 4000 -and $remTxt -match ':: === INICIO_POWERSHELL ===') {
+            $lines = $remTxt -split "\r?\n"
+            $idx = [Array]::IndexOf($lines, ':: === INICIO_POWERSHELL ===')
+            $psBody = $lines[($idx+1)..($lines.Length-1)] -join "`n"
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($psBody, [ref]$null, [ref]$errs)
+            if ($null -eq $errs -or $errs.Count -eq 0) {
+                $enc = New-Object System.Text.UTF8Encoding($false)
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                $rNorm = ($remTxt -replace "(\r\n|\r|\n)", "`n").TrimEnd("`r","`n")
+                $rHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($rNorm))) -replace '-','').ToLowerInvariant()
+                $lHash = ''
+                if ($selfPath -and (Test-Path $selfPath)) {
+                    $lNorm = (([IO.File]::ReadAllText($selfPath, $enc)) -replace "(\r\n|\r|\n)", "`n").TrimEnd("`r","`n")
+                    $lHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($lNorm))) -replace '-','').ToLowerInvariant()
+                }
+                $sha.Dispose()
+                $remoteAvail = ($rHash -ne '' -and $rHash -ne $lHash)
+                if ($remoteAvail -and -not $CheckOnly -and $selfPath) {
+                    Copy-Item $selfPath "$selfPath.bak_update" -Force -ErrorAction SilentlyContinue
+                    [IO.File]::WriteAllText($selfPath, ($rNorm -replace "`n","`r`n") + "`r`n", $enc)
+                    $selfUpdated = $true
+                    Log (" -> Codigo Otimizador atualizado via GitHub (SHA256=" + $rHash.Substring(0,8) + "...).") "Green"
+                }
+            }
+        }
+    } catch {}
+
+    # B. Verificacao/Atualizacao Hardware-Aware de AMD FSR (Magpie), DSL (OptiScaler + DirectStorage) e SDXL/IA
+    $relMag   = Get-OtimGitHubRelease -Repo 'Blinue/Magpie' -AssetRegex 'x64.*\.zip$'
+    $relOpti  = Get-OtimGitHubRelease -Repo 'optiscaler/OptiScaler' -AssetRegex '\.(zip|7z)$'
+    $comfyRx  = if ($Hw.GpuVendor -eq 'AMD') {'portable_amd\.7z$'} elseif ($Hw.GpuVendor -eq 'Intel') {'portable_intel\.7z$'} elseif ($Hw.CudaNumeric -ge 12.6) {'nvidia_cu126\.7z$'} else {'nvidia\.7z$'}
+    $relComfy = Get-OtimGitHubRelease -Repo 'comfyanonymous/ComfyUI' -AssetRegex $comfyRx
+    $torchVer = ''
+    try { $tp = Invoke-RestMethod 'https://pypi.org/pypi/torch/json' -TimeoutSec 12; if ($tp.info.version) { $torchVer = $tp.info.version } } catch {}
+
+    $allocConf = if ($Hw.LowVram) { 'expandable_segments:True,garbage_collection_threshold:0.6,max_split_size_mb:128' } elseif ($Hw.VramMB -le 8500) { 'expandable_segments:True,garbage_collection_threshold:0.8' } else { 'expandable_segments:True' }
+    $sdxlArgs  = if ($Hw.GpuVendor -eq 'NVIDIA') {
+        if ($Hw.LowVram -and $Hw.IsPascalOrOlder) { '--lowvram --opt-sdp-attention --no-half-vae --disable-nan-check' }
+        elseif ($Hw.LowVram) { '--lowvram --opt-sdp-attention' }
+        elseif ($Hw.VramMB -le 8500) { '--medvram-sdxl --opt-sdp-attention' }
+        else { '--opt-sdp-attention' }
+    } elseif ($Hw.LowVram) { '--lowvram --use-directml' } else { '--use-directml' }
+
+    $prevState = $null
+    if (Test-Path $OtimStateFile) { try { $prevState = Get-Content $OtimStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
+    $toolsBase = Join-Path $env:ProgramData 'ModoJogoAutomatico\Tools'
+
+    if (-not $CheckOnly) {
+        [Environment]::SetEnvironmentVariable('CUDA_MODULE_LOADING', 'LAZY', 'User')
+        [Environment]::SetEnvironmentVariable('SAFETENSORS_FAST_GPU', '1', 'User')
+        [Environment]::SetEnvironmentVariable('PYTORCH_CUDA_ALLOC_CONF', $allocConf, 'User')
+
+        # Atualizar Magpie/OptiScaler se ja estiverem instalados em ModoJogoAutomatico\Tools e houver tag mais nova
+        foreach ($tInfo in @(
+            @{ Name='Magpie'; Dir=(Join-Path $toolsBase 'Magpie'); Exe='Magpie.exe'; Rel=$relMag; OldTag=if($prevState){$prevState.MagpieTag}else{''} },
+            @{ Name='OptiScaler'; Dir=(Join-Path $toolsBase 'OptiScaler'); Exe='OptiScaler.dll'; Rel=$relOpti; OldTag=if($prevState){$prevState.OptiScalerTag}else{''} }
+        )) {
+            if ((Test-Path $tInfo.Dir) -and $tInfo.Rel.DownloadUrl -and ($tInfo.Rel.TagName -ne $tInfo.OldTag)) {
+                $tmpArc = Join-Path $env:TEMP $tInfo.Rel.AssetName
+                try {
+                    Invoke-WebRequest -Uri $tInfo.Rel.DownloadUrl -OutFile $tmpArc -UseBasicParsing -TimeoutSec 90
+                    if ($tmpArc -match '\.zip$') { Expand-Archive -Path $tmpArc -DestinationPath $tInfo.Dir -Force }
+                    elseif (Get-Command tar -ErrorAction SilentlyContinue) { & tar -xf $tmpArc -C $tInfo.Dir 2>$null }
+                    Log (" -> " + $tInfo.Name + " atualizado online para [" + $tInfo.Rel.TagName + "] conforme GPU " + $Hw.GpuVendor + ".") "Green"
+                } catch {} finally { Remove-Item $tmpArc -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        # Atualizar Launchers ComfyUI/WebUI existentes conforme GPU/VRAM e git pull se repositorio limpo
+        $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' -and (Test-Path $_.Root) }
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        foreach ($drv in $drives) {
+            Get-ChildItem -Path $drv.Root -Directory -Depth 2 -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -match 'ComfyUI|stable-diffusion|webui|forge|Fooocus|SDNext|InvokeAI'
+            } | ForEach-Object {
+                $d = $_.FullName
+                if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $d '.git'))) {
+                    $dirty = & git -C $d status --porcelain 2>$null
+                    if (-not $dirty) { & git -C $d pull --ff-only 2>$null | Out-Null }
+                }
+                $wb = Join-Path $d 'webui-user.bat'
+                if (Test-Path $wb) {
+                    $txt = [IO.File]::ReadAllText($wb, $enc)
+                    $upd = $txt -replace '(?m)^set\s+COMMANDLINE_ARGS=.*$', "set COMMANDLINE_ARGS=$sdxlArgs"
+                    if ($upd -notmatch 'PYTORCH_CUDA_ALLOC_CONF') { $upd = "set CUDA_MODULE_LOADING=LAZY`r`nset SAFETENSORS_FAST_GPU=1`r`nset PYTORCH_CUDA_ALLOC_CONF=$allocConf`r`n" + $upd }
+                    if ($upd -ne $txt) { [IO.File]::WriteAllText($wb, $upd, $enc) }
+                }
+                if ((Test-Path (Join-Path $d 'main.py')) -and ($d -match 'ComfyUI')) {
+                    $cFlags = if ($Hw.GpuVendor -ne 'NVIDIA') {'--directml --preview-method auto'} elseif ($Hw.LowVram) {'--lowvram --preview-method auto'} elseif ($Hw.VramMB -le 8500) {'--normalvram --preview-method auto'} else {'--highvram --preview-method auto'}
+                    [IO.File]::WriteAllText((Join-Path $d 'Start_SDXL_Optimized.bat'), "@echo off`r`nset CUDA_MODULE_LOADING=LAZY`r`nset SAFETENSORS_FAST_GPU=1`r`nset PYTORCH_CUDA_ALLOC_CONF=$allocConf`r`npython main.py $cFlags`r`npause`r`n", $enc)
+                }
+            }
+        }
+        try { Update-MpSignature -ErrorAction SilentlyContinue } catch {}
+    }
+
+    try {
+        New-Item -Path $OtimStateDir -ItemType Directory -Force | Out-Null
+        $stOut = [ordered]@{
+            LastCheckUtc   = [DateTime]::UtcNow.ToString('o')
+            Hardware       = "$($Hw.GpuVendor)|$($Hw.GpuName)|$($Hw.VramMB)MB|$($Hw.CpuName)"
+            DriverVersion  = $Hw.DriverVersion
+            CudaVersion    = $Hw.CudaVersion
+            SdxlArgs       = $sdxlArgs
+            MagpieTag      = $relMag.TagName
+            OptiScalerTag  = $relOpti.TagName
+            ComfyTag       = $relComfy.TagName
+            PyTorchOnline  = $torchVer
+        }
+        [IO.File]::WriteAllText($OtimStateFile, ($stOut | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+
+    Log (" -> Codigo .bat    : " + $(if ($selfUpdated) {"ATUALIZADO agora"} elseif ($remoteAvail) {"Nova versao disponivel online"} else {"Atualizado (igual ao GitHub)"})) $(if ($remoteAvail -and -not $selfUpdated) {'Yellow'} else {'Green'})
+    Log (" -> FSR / DSL / IA : GPU=$($Hw.GpuName) ($($Hw.VramMB) MB, CUDA=$($Hw.CudaVersion)) | Magpie=$($relMag.TagName) | OptiScaler=$($relOpti.TagName) | ComfyUI=$($relComfy.TagName) | PyTorch=$torchVer" ) "Gray"
+    Log (" -> Perfis SDXL    : $sdxlArgs | DirectStorage SSD=$($Hw.IsOsOnSSD) (Build $($Hw.OsBuild))") "Gray"
+    return [PSCustomObject]@{ SelfUpdated=$selfUpdated; SelfPath=$selfPath; UpdateAvailable=$remoteAvail }
+}
+
+if ($otimArgNorm -eq '-verificar') {
+    Write-Host "[VERIFICACAO ONLINE HARDWARE-AWARE - MODO SOMENTE LEITURA]" -ForegroundColor Cyan
+    $hwSnap = Get-OtimHardwareSnapshot
+    Invoke-OtimizadorOnlineUpdate -Hw $hwSnap -CheckOnly | Out-Null
+    exit 0
+}
+if ($otimArgNorm -eq '-atualizar') {
+    Write-Host "[ATUALIZACAO ONLINE HARDWARE-AWARE]" -ForegroundColor Cyan
+    $hwSnap = Get-OtimHardwareSnapshot
+    Invoke-OtimizadorOnlineUpdate -Hw $hwSnap | Out-Null
+    exit 0
 }
 
 Log "=== RELATORIO DE OTIMIZACAO UNIVERSAL WINDOWS 10/11 ===" "Green"
@@ -40,18 +263,26 @@ Log "`n[1/11] Criando Ponto de Restauracao do Sistema (Seguranca)..."
 Enable-ComputerRestore -Drive $env:SystemDrive
 Checkpoint-Computer -Description "Antes do Otimizador Universal" -RestorePointType "MODIFY_SETTINGS"
 
-# 2. Deteccao Automatica de Hardware
-Log "`n[2/11] Detectando Hardware (CPU, RAM, SSDs, HDDs, Notebook vs Desktop)..."
-$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
-$os = Get-CimInstance Win32_OperatingSystem
-$ramGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-$isLaptop = ($null -ne (Get-CimInstance Win32_Battery))
-$sysDriveLetter = $env:SystemDrive.TrimEnd(':')
-$sysPart = Get-Partition -DriveLetter $sysDriveLetter
-$sysDisk = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $sysPart.DiskNumber }
-$isOsOnSSD = ($sysDisk.MediaType -eq 'SSD')
-Log (" -> CPU: $cpu") "Gray"
+# 2. Deteccao Automatica de Hardware + Verificacao/Atualizacao Online
+Log "`n[2/11] Detectando Hardware (CPU, GPU, RAM, SSDs/HDDs, DirectStorage) e Atualizacoes Online..."
+$hwSnap   = Get-OtimHardwareSnapshot
+$cpu      = $hwSnap.CpuName
+$ramGB    = $hwSnap.RamTotalGB
+$isLaptop = $hwSnap.IsLaptop
+$sysDriveLetter = $hwSnap.SysDriveLetter
+$sysDisk  = $hwSnap.SysDisk
+$isOsOnSSD = $hwSnap.IsOsOnSSD
+Log (" -> CPU: $cpu | GPU: $($hwSnap.GpuName) ($($hwSnap.VramMB) MB)") "Gray"
 Log (" -> RAM: $ramGB GB | Notebook: $isLaptop | Sistema ($sysDriveLetter`:) em SSD: $isOsOnSSD (" + $sysDisk.FriendlyName + ")") "Gray"
+
+if ($otimArgNorm -ne '-noupdate') {
+    $upOtim = Invoke-OtimizadorOnlineUpdate -Hw $hwSnap
+    if ($upOtim.SelfUpdated -and $upOtim.SelfPath -and (Test-Path $upOtim.SelfPath)) {
+        Log " -> Reabrindo Otimizador com a versao mais recente do GitHub..." "Cyan"
+        Start-Process -FilePath $upOtim.SelfPath -ArgumentList '-noupdate' -Verb RunAs
+        exit 0
+    }
+}
 
 # 3. Verificacao e Limpeza de Entradas de Boot (Mantendo Apenas SSD se OS estiver em SSD)
 Log "`n[3/11] Verificando Gerenciador de Boot (BCD / UEFI)..."
@@ -528,4 +759,10 @@ Log " -> Executando verificador de arquivos do sistema (sfc /scannow)..." "Gray"
 sfc /scannow
 
 Log "`n=== OTIMIZACAO UNIVERSAL CONCLUIDA COM SUCESSO! ===" "Green"
+Write-Host "============================================================================" -ForegroundColor Cyan
+Write-Host "  PROCESSO FINALIZADO! Reinicie o computador para aplicar todos os ajustes." -ForegroundColor Cyan
+Write-Host "============================================================================" -ForegroundColor Cyan
 Write-Host "Relatorio completo salvo em: $logFile" -ForegroundColor Green
+if ($otimArgNorm -notin @('-verificar','-atualizar','-silent')) {
+    Read-Host "Pressione Enter para fechar" | Out-Null
+}
